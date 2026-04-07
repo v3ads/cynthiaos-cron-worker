@@ -21,8 +21,10 @@
 const APPFOLIO_BASE_URL      = "https://cynthiagardens.appfolio.com/api/v1/reports";
 const APPFOLIO_CLIENT_ID     = process.env.APPFOLIO_CLIENT_ID;
 const APPFOLIO_CLIENT_SECRET = process.env.APPFOLIO_CLIENT_SECRET;
+// Use Railway private networking (bypasses edge proxy 413 limit)
+// Falls back to public URL if INGESTION_URL is explicitly set
 const INGESTION_URL          = process.env.INGESTION_URL ||
-  "https://cynthiaos-ingestion-worker-production-8068.up.railway.app";
+  "http://cynthiaos-ingestion-worker.railway.internal:3001";
 
 // ── Tuning constants ──────────────────────────────────────────────────────────
 const INTER_REQUEST_DELAY_MS = 1_000;   // 1 s between every AppFolio API call
