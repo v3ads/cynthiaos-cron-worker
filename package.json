@@ -1,0 +1,12 @@
+{
+  "name": "cynthiaos-cron-worker",
+  "version": "1.0.0",
+  "description": "CynthiaOS daily pipeline cron worker — runs Gold promotion at 6 AM Eastern",
+  "main": "run.js",
+  "scripts": {
+    "start": "node run.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
