@@ -21,10 +21,12 @@
 const APPFOLIO_BASE_URL      = "https://cynthiagardens.appfolio.com/api/v1/reports";
 const APPFOLIO_CLIENT_ID     = process.env.APPFOLIO_CLIENT_ID;
 const APPFOLIO_CLIENT_SECRET = process.env.APPFOLIO_CLIENT_SECRET;
-// Use Railway private networking (bypasses edge proxy 413 limit)
-// Falls back to public URL if INGESTION_URL is explicitly set
-const INGESTION_URL          = process.env.INGESTION_URL ||
+// Primary: Railway private networking (bypasses edge proxy 413 limit)
+// Fallback: public URL (used if private networking fails)
+const INGESTION_URL_PRIMARY  = process.env.INGESTION_URL ||
   "http://cynthiaos-ingestion-worker.railway.internal:3001";
+const INGESTION_URL_FALLBACK = process.env.INGESTION_URL_FALLBACK ||
+  "https://cynthiaos-ingestion-worker-production-8068.up.railway.app";
 
 // ── Tuning constants ──────────────────────────────────────────────────────────
 const INTER_REQUEST_DELAY_MS = 1_000;   // 1 s between every AppFolio API call
@@ -32,6 +34,7 @@ const POLL_INTERVAL_MS       = 5_000;   // 5 s between 202 polls
 const POLL_MAX_ATTEMPTS      = 36;      // max 3 minutes per async report
 const FETCH_TIMEOUT_MS       = 30_000;  // 30 s per HTTP request
 const MAX_RETRIES            = 5;       // max retries for 429 / 5xx
+const INGEST_MAX_RETRIES     = 3;       // max retries for ingestion network errors
 const BACKOFF_BASE_MS        = 2_000;   // base for exponential backoff (2 s)
 const BACKOFF_MAX_MS         = 60_000;  // cap backoff at 60 s
 
@@ -199,13 +202,25 @@ async function fetchReport(report, authHeader) {
 }
 
 // ── POST one report to the CynthiaOS ingestion endpoint ──────────────────────
-async function ingestReport(reportId, reportDate, rows) {
+/**
+ * Attempts to POST a report to the ingestion worker.
+ * Retries on network-level failures (connection refused, DNS failure, timeout)
+ * with exponential backoff. Falls back to the public URL after the first
+ * network failure on the private URL, in case Railway private networking is
+ * temporarily unavailable.
+ */
+async function ingestReport(reportId, reportDate, rows, attempt = 0) {
+  // After the first network failure, try the fallback public URL
+  const baseUrl = (attempt > 0 && INGESTION_URL_FALLBACK)
+    ? INGESTION_URL_FALLBACK
+    : INGESTION_URL_PRIMARY;
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
   let res;
   try {
-    res = await fetch(`${INGESTION_URL}/ingest/report`, {
+    res = await fetch(`${baseUrl}/ingest/report`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -216,11 +231,29 @@ async function ingestReport(reportId, reportDate, rows) {
       }),
       signal: controller.signal,
     });
+  } catch (networkErr) {
+    // Network-level failure (connection refused, DNS, timeout, etc.)
+    clearTimeout(timer);
+    if (attempt >= INGEST_MAX_RETRIES) {
+      throw new Error(`Ingestion network error for ${reportId} after ${INGEST_MAX_RETRIES + 1} attempts: ${networkErr.message}`);
+    }
+    const wait = backoffMs(attempt);
+    const nextUrl = (INGESTION_URL_FALLBACK && attempt === 0) ? INGESTION_URL_FALLBACK : baseUrl;
+    console.warn(`  [ingest-retry] Network error for ${reportId} (attempt ${attempt + 1}/${INGEST_MAX_RETRIES + 1}). Retrying via ${nextUrl} in ${Math.round(wait / 1000)}s... Error: ${networkErr.message}`);
+    await sleep(wait);
+    return ingestReport(reportId, reportDate, rows, attempt + 1);
   } finally {
     clearTimeout(timer);
   }
 
   if (!res.ok) {
+    // HTTP error response — retry on 5xx, fail fast on 4xx
+    if (res.status >= 500 && attempt < INGEST_MAX_RETRIES) {
+      const wait = backoffMs(attempt);
+      console.warn(`  [ingest-retry] HTTP ${res.status} for ${reportId} (attempt ${attempt + 1}/${INGEST_MAX_RETRIES + 1}). Retrying in ${Math.round(wait / 1000)}s...`);
+      await sleep(wait);
+      return ingestReport(reportId, reportDate, rows, attempt + 1);
+    }
     const text = await res.text();
     throw new Error(`Ingestion failed for ${reportId}: HTTP ${res.status} — ${text.slice(0, 200)}`);
   }
