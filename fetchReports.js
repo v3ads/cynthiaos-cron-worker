@@ -110,6 +110,7 @@ function buildReportCatalogue(dates) {
     { id: "receivables_activity",     url: `${APPFOLIO_BASE_URL}/receivables_activity?${ytd}`,        reportDate: today },
     { id: "lease_history",            url: `${APPFOLIO_BASE_URL}/lease_history?${ytd}`,               reportDate: today },
     { id: "unit_turn_detail",         url: `${APPFOLIO_BASE_URL}/unit_turn_detail?${ytd}`,            reportDate: today },
+    { id: "move_in_move_out",          url: `${APPFOLIO_BASE_URL}/move_in_move_out?${ytd}`,           reportDate: today },
     { id: "renewal_summary",          url: `${APPFOLIO_BASE_URL}/renewal_summary?${ytd}`,             reportDate: today },
     { id: "prospect_source_tracking", url: `${APPFOLIO_BASE_URL}/prospect_source_tracking?${ytd}`,   reportDate: today },
     { id: "guest_cards",              url: `${APPFOLIO_BASE_URL}/guest_cards?${ytd}`,                 reportDate: today },
