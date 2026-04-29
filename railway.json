@@ -5,7 +5,6 @@
   },
   "deploy": {
     "startCommand": "node run.js",
-    "cronSchedule": "0 11 * * *",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 3
   }
