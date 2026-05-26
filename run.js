@@ -167,20 +167,61 @@ server.listen(PORT, "0.0.0.0", () => {
 });
 
 // ── Internal daily scheduler — fires at 6:00 AM Eastern every day ───────────────
-// Replaces Railway's native cronSchedule so the process stays alive as a
+// Uses setTimeout (not Railway cronSchedule) so the process stays alive as a
 // persistent HTTP service (enabling the Sync Now button) while still running
 // the daily 6 AM ET ingestion automatically.
+//
+// RESTART RESILIENCE: On startup, checks whether today's run was already
+// completed. If the service restarted after 6 AM and today's run was missed,
+// it fires immediately rather than waiting until tomorrow.
+
+const INGESTION_WORKER_URL = process.env.INGESTION_WORKER_URL ||
+  'https://cynthiaos-ingestion-worker-production.up.railway.app';
+
+/**
+ * Returns the date string (YYYY-MM-DD) for today in America/New_York.
+ */
+function todayET() {
+  return new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" }); // YYYY-MM-DD
+}
+
+/**
+ * Returns ms until the next 6:00 AM ET.
+ */
 function msUntilNext6amET() {
   const now = new Date();
-  // Get current time in America/New_York
   const nyNow = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
   const next6am = new Date(nyNow);
   next6am.setHours(6, 0, 0, 0);
-  // If 6 AM has already passed today, schedule for tomorrow
   if (nyNow >= next6am) next6am.setDate(next6am.getDate() + 1);
-  // Convert back to UTC ms delta
-  const deltaMs = next6am.getTime() - nyNow.getTime();
-  return deltaMs;
+  return next6am.getTime() - nyNow.getTime();
+}
+
+/**
+ * Checks the DB to see if a bronze record was ingested today.
+ * Returns true if today's run already completed.
+ */
+async function todayAlreadyRan() {
+  const postgres = require('postgres');
+  const DATABASE_URL = process.env.DATABASE_URL;
+  if (!DATABASE_URL) return false;
+  let sql;
+  try {
+    sql = postgres(DATABASE_URL, { ssl: 'require', max: 1 });
+    const today = todayET();
+    const rows = await sql`
+      SELECT 1 FROM bronze_appfolio_reports
+      WHERE report_type = 'rent_roll'
+        AND report_date::text = ${today}
+      LIMIT 1
+    `;
+    return rows.length > 0;
+  } catch (err) {
+    console.warn('[cron] todayAlreadyRan check failed:', err.message);
+    return false; // assume not run — safer to re-run than to skip
+  } finally {
+    if (sql) await sql.end();
+  }
 }
 
 function scheduleNextRun() {
@@ -203,9 +244,37 @@ function scheduleNextRun() {
     } else {
       console.warn("[cron] Scheduled run skipped — pipeline already running");
     }
-    // Schedule the next day's run
     scheduleNextRun();
   }, ms);
 }
 
-scheduleNextRun();
+// ── Startup catch-up check ────────────────────────────────────────────────────
+// If the service restarted after 6 AM ET and today's run was missed, fire
+// immediately. Otherwise just schedule the next 6 AM run as normal.
+(async () => {
+  const nyNow = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+  const currentHourET = nyNow.getHours();
+
+  if (currentHourET >= 6) {
+    // It's past 6 AM ET — check if today's run already happened
+    const alreadyRan = await todayAlreadyRan();
+    if (!alreadyRan) {
+      console.log(`[cron] Startup catch-up: today's run (${todayET()}) was missed — running now...`);
+      pipelineRunning = true;
+      try {
+        const result = await runPipeline();
+        console.log('[cron] Catch-up run completed:', JSON.stringify(result));
+      } catch (err) {
+        console.error('[cron] Catch-up run failed:', err.message);
+      } finally {
+        pipelineRunning = false;
+      }
+    } else {
+      console.log(`[cron] Startup check: today's run (${todayET()}) already completed — no catch-up needed.`);
+    }
+  } else {
+    console.log(`[cron] Startup check: it is before 6 AM ET — scheduling normally.`);
+  }
+
+  scheduleNextRun();
+})();
