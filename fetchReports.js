@@ -18,6 +18,37 @@
  *   window limit.
  */
 
+// ── Fetch Polyfill (using native https/http) ──────────────────────────────────
+if (typeof fetch === "undefined") {
+  const https = require("https");
+  const http = require("http");
+  global.fetch = function(url, options = {}) {
+    return new Promise((resolve, reject) => {
+      const protocol = url.startsWith("https") ? https : http;
+      const req = protocol.request(url, {
+        method: options.method || "GET",
+        headers: options.headers || {},
+        signal: options.signal
+      }, (res) => {
+        let data = "";
+        res.on("data", (chunk) => data += chunk);
+        res.on("end", () => {
+          resolve({
+            ok: res.statusCode >= 200 && res.statusCode < 300,
+            status: res.statusCode,
+            statusText: res.statusMessage,
+            text: () => Promise.resolve(data),
+            json: () => Promise.resolve(JSON.parse(data))
+          });
+        });
+      });
+      req.on("error", reject);
+      if (options.body) req.write(typeof options.body === "string" ? options.body : JSON.stringify(options.body));
+      req.end();
+    });
+  };
+}
+
 const APPFOLIO_BASE_URL      = "https://cynthiagardens.appfolio.com/api/v1/reports";
 const APPFOLIO_CLIENT_ID     = process.env.APPFOLIO_CLIENT_ID;
 const APPFOLIO_CLIENT_SECRET = process.env.APPFOLIO_CLIENT_SECRET;
