@@ -162,10 +162,6 @@ const server = http.createServer(async (req, res) => {
   res.end(JSON.stringify({ error: "not_found" }));
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[cron] HTTP server listening on port ${PORT}`);
-});
-
 // ── Internal daily scheduler — fires at 6:00 AM Eastern every day ───────────────
 // Uses setTimeout (not Railway cronSchedule) so the process stays alive as a
 // persistent HTTP service (enabling the Sync Now button) while still running
@@ -218,29 +214,39 @@ function scheduleNextRun() {
   }, ms);
 }
 
-// ── Startup catch-up check ────────────────────────────────────────────────────
-// If the service restarted after 6 AM ET, run the pipeline immediately.
-// The pipeline is fully idempotent (all inserts use ON CONFLICT DO NOTHING
-// or ON CONFLICT DO UPDATE), so running it twice in a day is harmless.
-// If it's before 6 AM, just schedule normally.
-(async () => {
-  const nyNow = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
-  const currentHourET = nyNow.getHours();
+// ── Main startup ──────────────────────────────────────────────────────────────
+server.listen(PORT, "0.0.0.0", async () => {
+  console.log(`[cron] HTTP server listening on port ${PORT}`);
+  console.log(`[cron] Node version: ${process.version}`);
 
-  if (currentHourET >= 6) {
-    console.log(`[cron] Startup catch-up: it is past 6 AM ET (${todayET()}) — running pipeline now to catch up any missed days...`);
-    pipelineRunning = true;
-    try {
-      const result = await runPipeline();
-      console.log('[cron] Catch-up run completed:', JSON.stringify(result));
-    } catch (err) {
-      console.error('[cron] Catch-up run failed:', err.message);
-    } finally {
-      pipelineRunning = false;
+  // ── Startup catch-up check ──────────────────────────────────────────────────
+  // If the service restarted after 6 AM ET, run the pipeline immediately.
+  // The pipeline is fully idempotent (all inserts use ON CONFLICT DO NOTHING
+  // or ON CONFLICT DO UPDATE), so running it twice in a day is harmless.
+  // If it's before 6 AM, just schedule normally.
+  try {
+    const nyNow = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+    const currentHourET = nyNow.getHours();
+
+    if (currentHourET >= 6) {
+      console.log(`[cron] Startup catch-up: it is past 6 AM ET (${todayET()}) — running pipeline now to catch up any missed days...`);
+      pipelineRunning = true;
+      runPipeline()
+        .then(result => {
+          console.log('[cron] Catch-up run completed:', JSON.stringify(result));
+        })
+        .catch(err => {
+          console.error('[cron] Catch-up run failed:', err.message);
+        })
+        .finally(() => {
+          pipelineRunning = false;
+        });
+    } else {
+      console.log(`[cron] Startup check: it is before 6 AM ET — scheduling normally.`);
     }
-  } else {
-    console.log(`[cron] Startup check: it is before 6 AM ET — scheduling normally.`);
+  } catch (err) {
+    console.error('[cron] Startup catch-up check failed:', err.message);
   }
 
   scheduleNextRun();
-})();
+});
