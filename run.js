@@ -1,71 +1,124 @@
 /**
- * CynthiaOS Cron Worker — Background Version
- * 
- * This version does NOT run an HTTP server. It runs as a persistent
- * background process that manages its own schedule. This bypasses
- * Railway 502/Health Check issues.
+ * CynthiaOS Daily Pipeline Cron Worker
+ *
+ * Runs as a persistent HTTP service on Railway.
+ * - GET /         → 200 health check (Railway default health probe)
+ * - GET /health   → 200 detailed health check
+ * - POST /run     → on-demand pipeline trigger (used by Sync Now button)
+ *
+ * Fires the full pipeline automatically at 6:00 AM ET every day.
+ * Uses a per-minute tick + date check so it's DST-safe and crash-resilient.
+ *
+ * Environment variables:
+ *   APPFOLIO_CLIENT_ID       — AppFolio Basic Auth client ID
+ *   APPFOLIO_CLIENT_SECRET   — AppFolio Basic Auth client secret
+ *   TRANSFORM_WORKER_URL     — Transform worker base URL (optional)
+ *   PORT                     — HTTP port (set automatically by Railway)
  */
-
-const logic = require("./fetchReports");
-const http = require("http");
+const http   = require("http");
+const { fetchAndIngestAllReports } = require("./fetchReports");
 
 const TRANSFORM_WORKER_URL = process.env.TRANSFORM_WORKER_URL ||
   "https://cynthiaos-transform-worker-production.up.railway.app";
+const PORT = parseInt(process.env.PORT ?? "3002", 10);
 
-async function postPromotion() {
-  return new Promise((resolve) => {
-    try {
-      const url = new URL(`${TRANSFORM_WORKER_URL}/gold/run`);
-      const req = http.request(url, { method: 'POST' }, (res) => {
-        let data = '';
-        res.on('data', (chunk) => data += chunk);
-        res.on('end', () => {
-          try { resolve(JSON.parse(data)); } catch (e) { resolve({ processed: false }); }
-        });
-      });
-      req.on('error', () => resolve({ processed: false }));
-      req.end();
-    } catch (e) { resolve({ processed: false }); }
-  });
-}
+let pipelineRunning = false;
+let lastRunDate     = "";
 
-async function runPipeline() {
-  console.log(`[cron] [${new Date().toISOString()}] Starting pipeline...`);
-  try {
-    await logic.fetchAndIngestAllReports();
-    console.log(`[cron] Ingestion complete. Starting gold promotion...`);
-    for (let i = 0; i < 50; i++) {
-      const res = await postPromotion();
-      if (!res.processed) break;
+// ── Gold promotion ────────────────────────────────────────────────────────────
+async function runGoldPromotion() {
+  for (let i = 0; i < 100; i++) {
+    const res = await fetch(`${TRANSFORM_WORKER_URL}/gold/run`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    }).then(r => r.json()).catch(() => ({ processed: false }));
+    if (!res.processed) {
+      console.log(`[cron] Gold queue drained after ${i + 1} iteration(s).`);
+      break;
     }
-    console.log(`[cron] Pipeline complete.`);
+  }
+}
+
+// ── Full pipeline ─────────────────────────────────────────────────────────────
+async function runPipeline() {
+  const startedAt = new Date().toISOString();
+  console.log(`[cron] Pipeline started at ${startedAt}`);
+  try {
+    const fetchResults = await fetchAndIngestAllReports();
+    console.log(`[cron] Ingestion: ${fetchResults.success.length} OK, ${fetchResults.failed.length} failed`);
+    await runGoldPromotion();
+    console.log(`[cron] Pipeline complete at ${new Date().toISOString()}`);
   } catch (err) {
-    console.error(`[cron] Pipeline failed:`, err.message);
+    console.error(`[cron] Pipeline error:`, err.message);
   }
 }
 
-// Main Loop
-console.log(`[cron] Worker started (Node ${process.version})`);
-
-let lastRunDate = "";
-
+// ── Daily scheduler: fires at 6 AM ET, once per calendar day ─────────────────
 async function tick() {
-  const now = new Date();
-  const nyTime = now.toLocaleString("en-US", { timeZone: "America/New_York" });
-  const nyDate = new Date(nyTime);
+  if (pipelineRunning) return;
+  const nyDate = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
   const dateStr = nyDate.toISOString().slice(0, 10);
-  const hour = nyDate.getHours();
+  const hour    = nyDate.getHours();
 
-  // 1. Startup Catch-up or Daily Run (6 AM ET)
   if (hour >= 6 && lastRunDate !== dateStr) {
-    console.log(`[cron] Triggering daily run for ${dateStr} (Hour: ${hour})`);
-    lastRunDate = dateStr;
-    await runPipeline();
+    lastRunDate    = dateStr;
+    pipelineRunning = true;
+    console.log(`[cron] Scheduled 6 AM ET run starting for ${dateStr}...`);
+    runPipeline().finally(() => { pipelineRunning = false; });
   }
 }
 
-// Run tick every minute
-setInterval(tick, 60000);
-
-// Immediate first tick
+setInterval(tick, 60_000);
 tick();
+
+const hoursUntil6am = () => {
+  const ny = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+  const next = new Date(ny); next.setHours(6, 0, 0, 0);
+  if (ny >= next) next.setDate(next.getDate() + 1);
+  return Math.round((next - ny) / 3_600_000 * 10) / 10;
+};
+
+// ── HTTP server ───────────────────────────────────────────────────────────────
+const server = http.createServer(async (req, res) => {
+
+  // Root — Railway default health check
+  if (req.method === "GET" && req.url === "/") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: "ok", service: "cynthiaos-cron-worker", pipeline_running: pipelineRunning }));
+    return;
+  }
+
+  // Health check
+  if (req.method === "GET" && req.url === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: "ok", pipeline_running: pipelineRunning, next_run_in_hours: hoursUntil6am() }));
+    return;
+  }
+
+  // On-demand pipeline trigger (Sync Now button)
+  if (req.method === "POST" && req.url === "/run") {
+    if (pipelineRunning) {
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: false, error: "Pipeline already running" }));
+      return;
+    }
+    const jobId = `sync_${Date.now()}`;
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      success: true,
+      job_id: jobId,
+      message: "Pipeline started. Data will be updated in approximately 5-10 minutes.",
+    }));
+    pipelineRunning = true;
+    runPipeline().finally(() => { pipelineRunning = false; });
+    return;
+  }
+
+  res.writeHead(404, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "not_found" }));
+});
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`[cron] HTTP server listening on port ${PORT}`);
+  console.log(`[cron] Next scheduled run in ~${hoursUntil6am()}h (6:00 AM ET)`);
+});
