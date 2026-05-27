@@ -1,71 +1,75 @@
-/**
- * CynthiaOS Daily Pipeline Cron Worker
- *
- * Runs every day at 6:00 AM Eastern (11:00 UTC) via Railway native cron.
- * Also exposes a POST /run HTTP endpoint for on-demand pipeline triggers
- * from the CynthiaOS "Sync Now" button.
- *
- * Executes the full pipeline in sequence:
- *
- *   1. Fetch all 29 AppFolio reports via the AppFolio API
- *   2. POST each report to the CynthiaOS ingestion endpoint (Bronze layer)
- *   3. Trigger Gold promotion on the Transform Worker (Silver → Gold)
- *      — loops until all pending Silver records are drained (not just once)
- *
- * Environment variables required:
- *   APPFOLIO_CLIENT_ID       — AppFolio Basic Auth client ID
- *   APPFOLIO_CLIENT_SECRET   — AppFolio Basic Auth client secret
- *   INGESTION_URL            — CynthiaOS ingestion worker base URL (optional, has default)
- *   TRANSFORM_WORKER_URL     — CynthiaOS transform worker base URL (optional, has default)
- */
 const http = require("http");
 const { fetchAndIngestAllReports } = require("./fetchReports");
 
 const TRANSFORM_WORKER_URL = process.env.TRANSFORM_WORKER_URL ||
   "https://cynthiaos-transform-worker-production.up.railway.app";
 
-const MAX_GOLD_ITERATIONS = 100;
 let pipelineRunning = false;
 
-async function runGoldPromotionOnce() {
-  const res = await fetch(`${TRANSFORM_WORKER_URL}/gold/run`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
+/**
+ * Simple HTTP POST helper using built-in 'http' to avoid 'fetch' issues
+ */
+function postPromotion() {
+  return new Promise((resolve, reject) => {
+    const url = new URL(`${TRANSFORM_WORKER_URL}/gold/run`);
+    const options = {
+      hostname: url.hostname,
+      path: url.pathname,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }
+    };
+    const req = http.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => data += chunk);
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          resolve({ processed: false, error: 'JSON parse error' });
+        }
+      });
+    });
+    req.on('error', (e) => reject(e));
+    req.end();
   });
-  const body = await res.json();
-  if (!res.ok) {
-    throw new Error(`Gold promotion failed: HTTP ${res.status} — ${JSON.stringify(body)}`);
-  }
-  return body;
 }
 
 async function drainGoldPromotion() {
   console.log("[cron] Step 3: Draining Gold promotion queue...");
   let promoted = 0;
-  let skipped  = 0;
   let iteration = 0;
-  while (iteration < MAX_GOLD_ITERATIONS) {
+  while (iteration < 100) {
     iteration++;
-    const result = await runGoldPromotionOnce();
-    console.log(`[cron]   Gold iteration ${iteration}: processed=${result.processed} report_type=${result.report_type ?? "n/a"}`);
-    if (!result.processed) break;
-    if (result.skipped) skipped++; else promoted++;
+    try {
+      const result = await postPromotion();
+      console.log(`[cron]   Gold iteration ${iteration}: processed=${result.processed}`);
+      if (!result.processed) break;
+      promoted++;
+    } catch (err) {
+      console.error(`[cron]   Gold iteration ${iteration} failed:`, err.message);
+      break;
+    }
   }
-  return { promoted, skipped, iterations: iteration };
+  return { promoted, iterations: iteration };
 }
 
 async function runPipeline() {
   const startedAt = new Date().toISOString();
   console.log(`[cron] Pipeline started at ${startedAt}`);
-  const fetchResults = await fetchAndIngestAllReports();
-  const goldResult = await drainGoldPromotion();
-  const finishedAt = new Date().toISOString();
-  console.log(`[cron] Pipeline completed at ${finishedAt}`);
-  return { started_at: startedAt, finished_at: finishedAt, reports: fetchResults, gold: goldResult };
+  try {
+    const fetchResults = await fetchAndIngestAllReports();
+    const goldResult = await drainGoldPromotion();
+    const finishedAt = new Date().toISOString();
+    console.log(`[cron] Pipeline completed at ${finishedAt}`);
+    return { success: true, reports: fetchResults, gold: goldResult };
+  } catch (err) {
+    console.error(`[cron] Pipeline failed:`, err.message);
+    return { success: false, error: err.message };
+  }
 }
 
 const PORT = parseInt(process.env.PORT ?? "3002", 10);
-const server = http.createServer(async (req, res) => {
+const server = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ status: "ok", running: pipelineRunning }));
@@ -87,23 +91,28 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[cron] Listening on ${PORT}`);
-  
-  // Daily scheduler: Check every 30 minutes if it's 6 AM ET
-  setInterval(async () => {
+  console.log(`[cron] HTTP server listening on port ${PORT}`);
+
+  // Daily scheduler (every 30 mins)
+  setInterval(() => {
     const nyNow = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
     if (nyNow.getHours() === 6 && nyNow.getMinutes() < 30 && !pipelineRunning) {
       console.log("[cron] Scheduled run starting...");
       pipelineRunning = true;
-      try { await runPipeline(); } catch (e) { console.error(e); } finally { pipelineRunning = false; }
+      runPipeline().catch(e => console.error(e)).finally(() => pipelineRunning = false);
     }
   }, 30 * 60 * 1000);
 
-  // Catch-up: Run once on startup if it's past 6 AM ET
+  // Catch-up run (after 10s to ensure server is stable)
   const nyNow = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
   if (nyNow.getHours() >= 6 && !pipelineRunning) {
-    console.log("[cron] Startup catch-up starting...");
-    pipelineRunning = true;
-    runPipeline().catch(e => console.error(e)).finally(() => pipelineRunning = false);
+    console.log("[cron] Scheduling startup catch-up in 10s...");
+    setTimeout(() => {
+      if (!pipelineRunning) {
+        console.log("[cron] Startup catch-up starting...");
+        pipelineRunning = true;
+        runPipeline().catch(e => console.error(e)).finally(() => pipelineRunning = false);
+      }
+    }, 10000);
   }
 });
