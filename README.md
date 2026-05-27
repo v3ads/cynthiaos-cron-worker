@@ -39,3 +39,4 @@ Runs every day at **6:00 AM Eastern (11:00 UTC)**. Executes the full CynthiaOS d
 
 This service is deployed on Railway. The `railway.json` file configures the cron schedule natively — Railway spins up the container, runs `node run.js` to completion, and shuts it down.
 # deployment trigger 20260527T212814
+# auto-deploy test 20260527T213902Z
