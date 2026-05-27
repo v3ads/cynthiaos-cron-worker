@@ -1,94 +1,71 @@
+/**
+ * CynthiaOS Cron Worker — Background Version
+ * 
+ * This version does NOT run an HTTP server. It runs as a persistent
+ * background process that manages its own schedule. This bypasses
+ * Railway 502/Health Check issues.
+ */
+
+const logic = require("./fetchReports");
 const http = require("http");
-
-// Lazy load logic to prevent startup crashes
-let fetchAndIngestAllReports = null;
-let loadError = null;
-
-try {
-  const logic = require("./fetchReports");
-  fetchAndIngestAllReports = logic.fetchAndIngestAllReports;
-} catch (err) {
-  console.error("[cron] Failed to load fetchReports logic:", err.message);
-  loadError = err.message;
-}
 
 const TRANSFORM_WORKER_URL = process.env.TRANSFORM_WORKER_URL ||
   "https://cynthiaos-transform-worker-production.up.railway.app";
 
-let pipelineRunning = false;
-
-function postPromotion() {
-  return new Promise((resolve, reject) => {
+async function postPromotion() {
+  return new Promise((resolve) => {
     try {
       const url = new URL(`${TRANSFORM_WORKER_URL}/gold/run`);
-      const options = {
-        hostname: url.hostname,
-        path: url.pathname,
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' }
-      };
-      const req = http.request(options, (res) => {
+      const req = http.request(url, { method: 'POST' }, (res) => {
         let data = '';
         res.on('data', (chunk) => data += chunk);
         res.on('end', () => {
-          try { resolve(JSON.parse(data)); } catch (e) { resolve({ processed: false, error: 'JSON parse error' }); }
+          try { resolve(JSON.parse(data)); } catch (e) { resolve({ processed: false }); }
         });
       });
-      req.on('error', (e) => reject(e));
+      req.on('error', () => resolve({ processed: false }));
       req.end();
-    } catch (e) { reject(e); }
+    } catch (e) { resolve({ processed: false }); }
   });
 }
 
-async function drainGoldPromotion() {
-  let promoted = 0;
-  for (let i = 0; i < 100; i++) {
-    try {
-      const result = await postPromotion();
-      if (!result.processed) break;
-      promoted++;
-    } catch (err) { break; }
-  }
-  return promoted;
-}
-
 async function runPipeline() {
-  if (!fetchAndIngestAllReports) throw new Error("Logic not loaded: " + loadError);
-  const startedAt = new Date().toISOString();
-  console.log(`[cron] Pipeline started: ${startedAt}`);
-  const fetchResults = await fetchAndIngestAllReports();
-  const promoted = await drainGoldPromotion();
-  console.log(`[cron] Pipeline done. Promoted: ${promoted}`);
-  return { success: true, reports: fetchResults, promoted };
+  console.log(`[cron] [${new Date().toISOString()}] Starting pipeline...`);
+  try {
+    await logic.fetchAndIngestAllReports();
+    console.log(`[cron] Ingestion complete. Starting gold promotion...`);
+    for (let i = 0; i < 50; i++) {
+      const res = await postPromotion();
+      if (!res.processed) break;
+    }
+    console.log(`[cron] Pipeline complete.`);
+  } catch (err) {
+    console.error(`[cron] Pipeline failed:`, err.message);
+  }
 }
 
-const PORT = parseInt(process.env.PORT ?? "3002", 10);
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "application/json" });
-  if (req.url === "/health") {
-    res.end(JSON.stringify({ status: "ok", running: pipelineRunning, load_error: loadError, node: process.version }));
-    return;
-  }
-  if (req.method === "POST" && req.url === "/run") {
-    if (pipelineRunning) return res.end(JSON.stringify({ success: false, error: "Running" }));
-    pipelineRunning = true;
-    res.end(JSON.stringify({ success: true, message: "Started" }));
-    runPipeline().catch(e => console.error(e)).finally(() => pipelineRunning = false);
-    return;
-  }
-  res.end(JSON.stringify({ error: "not_found" }));
-});
+// Main Loop
+console.log(`[cron] Worker started (Node ${process.version})`);
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[cron] Server listening on ${PORT} (Node ${process.version})`);
-  
-  // Catch-up in 5s
-  setTimeout(() => {
-    const nyNow = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
-    if (nyNow.getHours() >= 6 && !pipelineRunning && fetchAndIngestAllReports) {
-      console.log("[cron] Startup catch-up starting...");
-      pipelineRunning = true;
-      runPipeline().catch(e => console.error(e)).finally(() => pipelineRunning = false);
-    }
-  }, 5000);
-});
+let lastRunDate = "";
+
+async function tick() {
+  const now = new Date();
+  const nyTime = now.toLocaleString("en-US", { timeZone: "America/New_York" });
+  const nyDate = new Date(nyTime);
+  const dateStr = nyDate.toISOString().slice(0, 10);
+  const hour = nyDate.getHours();
+
+  // 1. Startup Catch-up or Daily Run (6 AM ET)
+  if (hour >= 6 && lastRunDate !== dateStr) {
+    console.log(`[cron] Triggering daily run for ${dateStr} (Hour: ${hour})`);
+    lastRunDate = dateStr;
+    await runPipeline();
+  }
+}
+
+// Run tick every minute
+setInterval(tick, 60000);
+
+// Immediate first tick
+tick();
