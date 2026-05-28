@@ -64,7 +64,14 @@ async function tick() {
     lastRunDate    = dateStr;
     pipelineRunning = true;
     console.log(`[cron] Scheduled 6 AM ET run starting for ${dateStr}...`);
-    runPipeline().finally(() => { pipelineRunning = false; });
+    runPipeline().finally(() => {
+      pipelineRunning = false;
+      // Exit cleanly so Railway Cron Job marks the run as complete.
+      // The HTTP server is intentionally kept alive during the run for /run endpoint
+      // compatibility, but must exit after the scheduled run finishes.
+      console.log('[cron] Pipeline complete — exiting cleanly.');
+      process.exit(0);
+    });
   }
 }
 
