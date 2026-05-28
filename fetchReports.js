@@ -146,7 +146,7 @@ function buildReportCatalogue(dates) {
     { id: "prospect_source_tracking", url: `${APPFOLIO_BASE_URL}/prospect_source_tracking?${ytd}`,   reportDate: today },
     { id: "guest_cards",              url: `${APPFOLIO_BASE_URL}/guest_cards?${ytd}`,                 reportDate: today },
     { id: "rental_applications",      url: `${APPFOLIO_BASE_URL}/rental_applications?${ytd}`,         reportDate: today },
-    { id: "work_order",               url: `${APPFOLIO_BASE_URL}/work_order?${ytd}`,                  reportDate: today },
+    { id: "work_order",               url: `${APPFOLIO_BASE_URL}/work_order`,                         reportDate: today }, // No date filter — returns ALL work orders including open/active
     // T12
     { id: "twelve_month_cash_flow",        url: `${APPFOLIO_BASE_URL}/twelve_month_cash_flow?${t12}`,        reportDate: today },
     { id: "twelve_month_income_statement", url: `${APPFOLIO_BASE_URL}/twelve_month_income_statement?${t12}`, reportDate: today },
