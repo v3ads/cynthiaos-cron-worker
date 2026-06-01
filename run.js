@@ -59,18 +59,19 @@ async function tick() {
   const nyDate = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
   const dateStr = nyDate.toISOString().slice(0, 10);
   const hour    = nyDate.getHours();
+  const minute  = nyDate.getMinutes();
 
-  if (hour >= 6 && lastRunDate !== dateStr) {
-    lastRunDate    = dateStr;
+  // Run once per day only inside the intended 6:00-6:10 AM ET window.
+  // The previous `hour >= 6` catch-up condition caused every post-6 AM
+  // deploy/restart to immediately launch a long AppFolio pipeline, which made
+  // the web service fail health checks and prevented on-demand /run usage.
+  if (hour === 6 && minute <= 10 && lastRunDate !== dateStr) {
+    lastRunDate     = dateStr;
     pipelineRunning = true;
     console.log(`[cron] Scheduled 6 AM ET run starting for ${dateStr}...`);
     runPipeline().finally(() => {
       pipelineRunning = false;
-      // Exit cleanly so Railway Cron Job marks the run as complete.
-      // The HTTP server is intentionally kept alive during the run for /run endpoint
-      // compatibility, but must exit after the scheduled run finishes.
-      console.log('[cron] Pipeline complete — exiting cleanly.');
-      process.exit(0);
+      console.log('[cron] Scheduled pipeline complete; service remains online for health checks and /run.');
     });
   }
 }
