@@ -13,6 +13,7 @@
  *   APPFOLIO_CLIENT_ID       — AppFolio Basic Auth client ID
  *   APPFOLIO_CLIENT_SECRET   — AppFolio Basic Auth client secret
  *   TRANSFORM_WORKER_URL     — Transform worker base URL (optional)
+ *   WORKER_SHARED_SECRET     — Shared secret for the transform worker (REQUIRED)
  *   PORT                     — HTTP port (set automatically by Railway)
  */
 const http   = require("http");
@@ -30,7 +31,14 @@ async function runGoldPromotion() {
   for (let i = 0; i < 100; i++) {
     const res = await fetch(`${TRANSFORM_WORKER_URL}/gold/run`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        // Service-to-service credential for the transform worker's auth
+        // boundary. The worker fails closed — if WORKER_SHARED_SECRET is not
+        // set here the nightly Gold promotion will 503 and the dashboard goes
+        // stale, so this var must exist on this service.
+        "X-Worker-Key": process.env.WORKER_SHARED_SECRET ?? "",
+      },
     }).then(r => r.json()).catch(() => ({ processed: false }));
     if (!res.processed) {
       console.log(`[cron] Gold queue drained after ${i + 1} iteration(s).`);
